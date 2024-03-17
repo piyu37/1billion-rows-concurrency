@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var input = flag.String("input", "measurements.txt", "path of the input file to evaluate")
@@ -15,6 +16,17 @@ var output = flag.String("output", "output", "path of the output file")
 
 type stats struct {
 	min, max, mean float64
+}
+
+func produceMeasurements(inputFile *os.File, lineCh chan<- string) {
+	scanner := bufio.NewScanner(inputFile)
+
+	for scanner.Scan() {
+		text := scanner.Text()
+		lineCh <- text
+	}
+
+	close(lineCh)
 }
 
 func evaluate(filePath, outputFilePath string) {
@@ -32,13 +44,14 @@ func evaluate(filePath, outputFilePath string) {
 
 	defer outputFile.Close()
 
+	lineCh := make(chan string, 100)
+
 	stationTemps := make(map[string][]float64)
 
-	scanner := bufio.NewScanner(inputFile)
+	// decouple producer and consumer of file read using channel
+	go produceMeasurements(inputFile, lineCh)
 
-	for scanner.Scan() {
-		text := scanner.Text()
-
+	for text := range lineCh {
 		// refactoring: instead of using strings.Split, use strings.Index as
 		// split creates a new slice for each split part, leading to more memory usage
 		// and subsequent GC overhead
@@ -49,33 +62,46 @@ func evaluate(filePath, outputFilePath string) {
 		stationTemps[city] = append(stationTemps[city], temp)
 	}
 
+	formatAndWriteMesaurements(outputFile, stationTemps)
+}
+
+func formatAndWriteMesaurements(outputFile *os.File, stationTemps map[string][]float64) {
 	result := make(map[string]stats)
-
-	for city, tempreatures := range stationTemps {
-		min, max, sum := tempreatures[0], tempreatures[0], 0.0
-
-		for i := range tempreatures {
-			if tempreatures[i] < min {
-				min = tempreatures[i]
-			}
-
-			if tempreatures[i] > max {
-				max = tempreatures[i]
-			}
-
-			sum += tempreatures[i]
-		}
-
-		mean := sum / float64(len(tempreatures))
-
-		result[city] = stats{min, max, mean}
-	}
-
+	var mx sync.Mutex
+	var wg sync.WaitGroup
 	stations := make([]string, 0)
 
-	for i := range result {
-		stations = append(stations, i)
+	for city, tempreatures := range stationTemps {
+		stations = append(stations, city)
+		wg.Add(1)
+		// running separate goroutines for separate cities for faster process
+		go func(city string, tempreatures []float64) {
+			defer wg.Done()
+
+			min, max, sum := tempreatures[0], tempreatures[0], 0.0
+
+			for i := range tempreatures {
+				if tempreatures[i] < min {
+					min = tempreatures[i]
+				}
+
+				if tempreatures[i] > max {
+					max = tempreatures[i]
+				}
+
+				sum += tempreatures[i]
+			}
+
+			mean := sum / float64(len(tempreatures))
+
+			mx.Lock()
+			result[city] = stats{min, max, mean}
+			mx.Unlock()
+
+		}(city, tempreatures)
 	}
+
+	wg.Wait()
 
 	sort.Strings(stations)
 
