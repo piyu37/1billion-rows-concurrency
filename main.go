@@ -14,19 +14,34 @@ import (
 var input = flag.String("input", "measurements.txt", "path of the input file to evaluate")
 var output = flag.String("output", "output", "path of the output file")
 
+const batchSize = 100
+
 type stats struct {
 	min, max, mean float64
 }
 
-func produceMeasurements(inputFile *os.File, lineCh chan<- string) {
+func produceMeasurements(inputFile *os.File, batchCh chan<- []string) {
 	scanner := bufio.NewScanner(inputFile)
-
+	batch := make([]string, batchSize)
+	count := 0
 	for scanner.Scan() {
 		text := scanner.Text()
-		lineCh <- text
+		batch[count] = text
+		count++
+
+		if count == batchSize {
+			localCopy := make([]string, batchSize)
+			copy(localCopy, batch)
+			batchCh <- localCopy
+			count = 0
+		}
 	}
 
-	close(lineCh)
+	if count != 0 {
+		batchCh <- batch[:count]
+	}
+
+	close(batchCh)
 }
 
 func evaluate(filePath, outputFilePath string) {
@@ -44,22 +59,29 @@ func evaluate(filePath, outputFilePath string) {
 
 	defer outputFile.Close()
 
-	lineCh := make(chan string, 100)
+	batchCh := make(chan []string, 100)
 
 	stationTemps := make(map[string][]float64)
 
 	// decouple producer and consumer of file read using channel
-	go produceMeasurements(inputFile, lineCh)
+	go produceMeasurements(inputFile, batchCh)
 
-	for text := range lineCh {
-		// refactoring: instead of using strings.Split, use strings.Index as
-		// split creates a new slice for each split part, leading to more memory usage
-		// and subsequent GC overhead
-		index := strings.Index(text, ";")
-		city := text[:index]
-		tempString := text[index+1:]
-		temp, _ := strconv.ParseFloat(tempString, 64)
-		stationTemps[city] = append(stationTemps[city], temp)
+	for batch := range batchCh {
+		for _, text := range batch {
+			// refactoring: instead of using strings.Split, use strings.Index as
+			// split creates a new slice for each split part, leading to more memory usage
+			// and subsequent GC overhead
+			index := strings.Index(text, ";")
+
+			// handline case when we are not getting the line in correct format/improper text
+			if index == -1 {
+				continue
+			}
+			city := text[:index]
+			tempString := text[index+1:]
+			temp, _ := strconv.ParseFloat(tempString, 64)
+			stationTemps[city] = append(stationTemps[city], temp)
+		}
 	}
 
 	formatAndWriteMesaurements(outputFile, stationTemps)
