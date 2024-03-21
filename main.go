@@ -2,46 +2,62 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var input = flag.String("input", "measurements.txt", "path of the input file to evaluate")
 var output = flag.String("output", "output", "path of the output file")
 
-const batchSize = 100
+const chunkSize = 64 * 1024 * 1024
 
 type stats struct {
 	min, max, sum float64
 	count         int64
 }
 
-func produceMeasurements(inputFile *os.File, batchCh chan<- []string) {
-	scanner := bufio.NewScanner(inputFile)
-	batch := make([]string, batchSize)
-	count := 0
-	for scanner.Scan() {
-		text := scanner.Text()
-		batch[count] = text
-		count++
+func readMeasurements(inputFile *os.File, chunkStream chan []byte, resultStream chan map[string]stats,
+	wg *sync.WaitGroup) {
+	buf := make([]byte, chunkSize)
+	leftover := make([]byte, 0, chunkSize)
+	for {
+		bytesRead, err := inputFile.Read(buf)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 
-		if count == batchSize {
-			localCopy := make([]string, batchSize)
-			copy(localCopy, batch)
-			batchCh <- localCopy
-			count = 0
+			panic(err)
 		}
+
+		buf = buf[:bytesRead]
+		chunkToSend := make([]byte, bytesRead)
+		copy(chunkToSend, buf)
+
+		lastNewLineIndex := bytes.LastIndex(buf, []byte{'\n'})
+
+		chunkToSend = append(leftover, buf[:lastNewLineIndex+1]...)
+		leftover = make([]byte, len(buf[lastNewLineIndex+1:]))
+		copy(leftover, buf[lastNewLineIndex+1:])
+
+		chunkStream <- chunkToSend
 	}
 
-	if count != 0 {
-		batchCh <- batch[:count]
-	}
+	close(chunkStream)
 
-	close(batchCh)
+	// wait for all chunks to be proccessed before closing the result stream
+	wg.Wait()
+
+	close(resultStream)
 }
 
 func evaluate(filePath, outputFilePath string) {
@@ -59,52 +75,92 @@ func evaluate(filePath, outputFilePath string) {
 
 	defer outputFile.Close()
 
-	batchCh := make(chan []string, 100)
-
+	chunkStream := make(chan []byte, 15)
+	resultStream := make(chan map[string]stats, 10)
+	var wg sync.WaitGroup
 	stationTempMap := make(map[string]stats)
 
-	// decouple producer and consumer of file read using channel
-	go produceMeasurements(inputFile, batchCh)
+	// running gorutines no. of cpu cores-1 parallel process file read chunks
+	for i := 0; i < runtime.NumCPU()-1; i++ {
+		wg.Add(1)
 
-	for batch := range batchCh {
-		for _, text := range batch {
-			// refactoring: instead of using strings.Split, use strings.Index as
-			// split creates a new slice for each split part, leading to more memory usage
-			// and subsequent GC overhead
-			index := strings.Index(text, ";")
-
-			// handline case when we are not getting the line in correct format/improper text
-			if index == -1 {
-				continue
+		go func() {
+			for chunk := range chunkStream {
+				processReadChunk(chunk, resultStream)
 			}
-			city := text[:index]
-			tempString := text[index+1:]
-			temp, _ := strconv.ParseFloat(tempString, 64)
-			if v, ok := stationTempMap[city]; ok {
-				if temp < v.min {
-					v.min = temp
+
+			wg.Done()
+		}()
+	}
+
+	// decouple producer and consumer of file read using channel
+	go readMeasurements(inputFile, chunkStream, resultStream, &wg)
+
+	for data := range resultStream {
+		for city, tempInfo := range data {
+			if val, ok := stationTempMap[city]; ok {
+				if tempInfo.min < val.min {
+					val.min = tempInfo.min
 				}
 
-				if temp > v.max {
-					v.max = temp
+				if tempInfo.max > val.max {
+					val.max = tempInfo.max
 				}
 
-				v.sum += temp
-				v.count++
+				val.sum += tempInfo.sum
+				val.count += tempInfo.count
 
-				stationTempMap[city] = v
+				stationTempMap[city] = val
 			} else {
-				stationTempMap[city] = stats{
-					min:   temp,
-					max:   temp,
-					sum:   temp,
-					count: 1,
-				}
+				stationTempMap[city] = tempInfo
 			}
 		}
 	}
 
 	formatAndWriteMesaurements(outputFile, stationTempMap)
+}
+
+func processReadChunk(buf []byte, resultStream chan<- map[string]stats) {
+	var stringBuilder strings.Builder
+	stationTempMap := make(map[string]stats)
+	var city string
+
+	for _, char := range buf {
+		if char == ';' {
+			city = stringBuilder.String()
+			stringBuilder.Reset()
+		} else if char == '\n' {
+			if stringBuilder.Len() != 0 && len(city) != 0 {
+				temp, _ := strconv.ParseFloat(stringBuilder.String(), 64)
+				stringBuilder.Reset()
+				if val, ok := stationTempMap[city]; ok {
+					if temp < val.min {
+						val.min = temp
+					}
+
+					if temp > val.max {
+						val.max = temp
+					}
+
+					val.sum += temp
+					val.count++
+
+					stationTempMap[city] = val
+				} else {
+					stationTempMap[city] = stats{
+						min:   temp,
+						max:   temp,
+						sum:   temp,
+						count: 1,
+					}
+				}
+			}
+		} else {
+			stringBuilder.WriteByte(char)
+		}
+	}
+
+	resultStream <- stationTempMap
 }
 
 func formatAndWriteMesaurements(outputFile *os.File, stationTempMap map[string]stats) {
