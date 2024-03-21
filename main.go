@@ -11,7 +11,6 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 )
 
@@ -121,18 +120,21 @@ func evaluate(filePath, outputFilePath string) {
 }
 
 func processReadChunk(buf []byte, resultStream chan<- map[string]stats) {
-	var stringBuilder strings.Builder
 	stationTempMap := make(map[string]stats)
 	var city string
+	var start int
 
-	for _, char := range buf {
-		if char == ';' {
-			city = stringBuilder.String()
-			stringBuilder.Reset()
-		} else if char == '\n' {
-			if stringBuilder.Len() != 0 && len(city) != 0 {
-				temp, _ := strconv.ParseFloat(stringBuilder.String(), 64)
-				stringBuilder.Reset()
+	stringBuf := string(buf)
+
+	for index, char := range stringBuf {
+		switch char {
+		case ';':
+			city = stringBuf[start:index]
+			start = index + 1
+		case '\n':
+			if index-start > 0 && len(city) != 0 {
+				temp, _ := strconv.ParseFloat(stringBuf[start:index], 64)
+				start = index + 1
 				if val, ok := stationTempMap[city]; ok {
 					if temp < val.min {
 						val.min = temp
@@ -155,8 +157,6 @@ func processReadChunk(buf []byte, resultStream chan<- map[string]stats) {
 					}
 				}
 			}
-		} else {
-			stringBuilder.WriteByte(char)
 		}
 	}
 
